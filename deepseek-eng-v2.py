@@ -5,7 +5,7 @@ import sys
 import json
 from pathlib import Path
 from textwrap import dedent
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from openai import OpenAI
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -23,6 +23,12 @@ if sys.platform == "win32":
 
 # Initialize Rich console
 console = Console()
+
+# Token limits and management
+MAX_CONTEXT_TOKENS = 50000  # Leave buffer for responses (API limit is 65536)
+MAX_FILE_TOKENS = 8000      # Max tokens per file
+MAX_FILES_PER_ADD = 20      # Max files to add at once
+CHARS_PER_TOKEN = 4         # Rough estimate
 
 # Try to initialize prompt session with fallback
 try:
@@ -218,8 +224,51 @@ system_PROMPT = dedent("""\
 """)
 
 # --------------------------------------------------------------------------------
-# 4. Helper functions 
+# 4. Helper functions with token management
 # --------------------------------------------------------------------------------
+
+def estimate_tokens(text: str) -> int:
+    """Estimate the number of tokens in a text string."""
+    if not text:
+        return 0
+    # Rough estimate: ~4 characters per token
+    # Add 10% buffer for safety
+    return int(len(text) / CHARS_PER_TOKEN * 1.1)
+
+def get_conversation_tokens() -> int:
+    """Calculate total tokens in current conversation."""
+    total = 0
+    for msg in conversation_history:
+        if msg.get("content"):
+            total += estimate_tokens(msg["content"])
+        # Tool calls also use tokens
+        if msg.get("tool_calls"):
+            total += estimate_tokens(json.dumps(msg["tool_calls"]))
+    return total
+
+def check_token_limit(additional_tokens: int) -> Tuple[bool, int]:
+    """Check if adding tokens would exceed limit. Returns (can_add, current_total)."""
+    current = get_conversation_tokens()
+    if current + additional_tokens > MAX_CONTEXT_TOKENS:
+        return False, current
+    return True, current
+
+def truncate_content(content: str, max_tokens: int) -> str:
+    """Truncate content to fit within token limit."""
+    estimated_tokens = estimate_tokens(content)
+    if estimated_tokens <= max_tokens:
+        return content
+    
+    # Calculate approximate character limit
+    char_limit = max_tokens * CHARS_PER_TOKEN
+    truncated = content[:char_limit]
+    
+    # Try to truncate at a line boundary
+    last_newline = truncated.rfind('\n')
+    if last_newline > char_limit * 0.8:  # If we found a newline in the last 20%
+        truncated = truncated[:last_newline]
+    
+    return truncated + "\n\n... [Content truncated due to token limit]"
 
 def read_local_file(file_path: str) -> str:
     """Return the text content of a local file."""
@@ -292,22 +341,38 @@ def try_handle_add_command(user_input: str) -> bool:
         try:
             normalized_path = normalize_path(path_to_add)
             if os.path.isdir(normalized_path):
-                # Handle entire directory
+                # Handle entire directory with token limits
                 add_directory_to_conversation(normalized_path)
             else:
-                # Handle a single file as before
+                # Handle a single file
                 content = read_local_file(normalized_path)
+                file_tokens = estimate_tokens(content)
+                
+                can_add, current_tokens = check_token_limit(file_tokens)
+                if not can_add:
+                    console.print(f"[bold red]✗[/bold red] Cannot add file: would exceed token limit")
+                    console.print(f"[yellow]Current tokens: {current_tokens:,} / {MAX_CONTEXT_TOKENS:,}[/yellow]")
+                    console.print(f"[yellow]File tokens: {file_tokens:,}[/yellow]")
+                    return True
+                
+                # Truncate if needed
+                if file_tokens > MAX_FILE_TOKENS:
+                    console.print(f"[yellow]⚠ File is large ({file_tokens:,} tokens). Truncating to {MAX_FILE_TOKENS:,} tokens.[/yellow]")
+                    content = truncate_content(content, MAX_FILE_TOKENS)
+                
                 conversation_history.append({
                     "role": "system",
                     "content": f"Content of file '{normalized_path}':\n\n{content}"
                 })
-                console.print(f"[bold blue]✓[/bold blue] Added file '[bright_cyan]{normalized_path}[/bright_cyan]' to conversation.\n")
+                console.print(f"[bold blue]✓[/bold blue] Added file '[bright_cyan]{normalized_path}[/bright_cyan]' to conversation.")
+                console.print(f"[dim]Tokens used: {estimate_tokens(content):,} (Total: {get_conversation_tokens():,} / {MAX_CONTEXT_TOKENS:,})[/dim]\n")
         except OSError as e:
             console.print(f"[bold red]✗[/bold red] Could not add path '[bright_cyan]{path_to_add}[/bright_cyan]': {e}\n")
         return True
     return False
 
 def add_directory_to_conversation(directory_path: str):
+    """Add directory contents with improved token management."""
     with console.status("[bold bright_blue]🔍 Scanning directory...[/bold bright_blue]") as status:
         excluded_files = {
             # Python specific
@@ -349,71 +414,109 @@ def add_directory_to_conversation(directory_path: str):
             # Font files
             ".ttf", ".otf", ".woff", ".woff2", ".eot"
         }
+        
+        # Collect eligible files first
+        eligible_files = []
         skipped_files = []
-        added_files = []
-        total_files_processed = 0
-        max_files = 1000  # Reasonable limit for files to process
-        max_file_size = 5_000_000  # 5MB limit
-
+        max_file_size = 500_000  # 500KB limit per file for directories
+        
         for root, dirs, files in os.walk(directory_path):
-            if total_files_processed >= max_files:
-                console.print(f"[bold yellow]⚠[/bold yellow] Reached maximum file limit ({max_files})")
-                break
-
-            status.update(f"[bold bright_blue]🔍 Scanning {root}...[/bold bright_blue]")
             # Skip hidden directories and excluded directories
             dirs[:] = [d for d in dirs if not d.startswith('.') and d not in excluded_files]
-
+            
             for file in files:
-                if total_files_processed >= max_files:
-                    break
-
                 if file.startswith('.') or file in excluded_files:
                     skipped_files.append(os.path.join(root, file))
                     continue
-
+                
                 _, ext = os.path.splitext(file)
                 if ext.lower() in excluded_extensions:
                     skipped_files.append(os.path.join(root, file))
                     continue
-
+                
                 full_path = os.path.join(root, file)
-
+                
                 try:
-                    # Check file size before processing
-                    if os.path.getsize(full_path) > max_file_size:
-                        skipped_files.append(f"{full_path} (exceeds size limit)")
+                    # Check file size
+                    file_size = os.path.getsize(full_path)
+                    if file_size > max_file_size:
+                        skipped_files.append(f"{full_path} (too large: {file_size:,} bytes)")
                         continue
-
+                    
                     # Check if it's binary
                     if is_binary_file(full_path):
-                        skipped_files.append(full_path)
+                        skipped_files.append(f"{full_path} (binary)")
                         continue
-
-                    normalized_path = normalize_path(full_path)
-                    content = read_local_file(normalized_path)
-                    conversation_history.append({
-                        "role": "system",
-                        "content": f"Content of file '{normalized_path}':\n\n{content}"
-                    })
-                    added_files.append(normalized_path)
-                    total_files_processed += 1
-
+                    
+                    eligible_files.append(full_path)
+                    
                 except OSError:
-                    skipped_files.append(full_path)
-
-        console.print(f"[bold blue]✓[/bold blue] Added folder '[bright_cyan]{directory_path}[/bright_cyan]' to conversation.")
-        if added_files:
-            console.print(f"\n[bold bright_blue]📁 Added files:[/bold bright_blue] [dim]({len(added_files)} of {total_files_processed})[/dim]")
-            for f in added_files:
-                console.print(f"  [bright_cyan]📄 {f}[/bright_cyan]")
-        if skipped_files:
-            console.print(f"\n[bold yellow]⏭ Skipped files:[/bold yellow] [dim]({len(skipped_files)})[/dim]")
-            for f in skipped_files[:10]:  # Show only first 10 to avoid clutter
-                console.print(f"  [yellow dim]⚠ {f}[/yellow dim]")
-            if len(skipped_files) > 10:
-                console.print(f"  [dim]... and {len(skipped_files) - 10} more[/dim]")
-        console.print()
+                    skipped_files.append(f"{full_path} (error reading)")
+        
+        # Now process eligible files with token limits
+        added_files = []
+        total_tokens_added = 0
+        current_tokens = get_conversation_tokens()
+        
+        console.print(f"\n[bold yellow]⚠ Token Budget:[/bold yellow]")
+        console.print(f"Current usage: {current_tokens:,} / {MAX_CONTEXT_TOKENS:,} tokens")
+        console.print(f"Available: {MAX_CONTEXT_TOKENS - current_tokens:,} tokens")
+        console.print(f"Found {len(eligible_files)} eligible files\n")
+        
+        # Limit files to add
+        files_to_add = eligible_files[:MAX_FILES_PER_ADD]
+        if len(eligible_files) > MAX_FILES_PER_ADD:
+            console.print(f"[yellow]⚠ Limiting to first {MAX_FILES_PER_ADD} files (found {len(eligible_files)})[/yellow]\n")
+        
+        # Collect file contents
+        files_content = []
+        
+        for file_path in files_to_add:
+            try:
+                normalized_path = normalize_path(file_path)
+                content = read_local_file(normalized_path)
+                file_tokens = estimate_tokens(content)
+                
+                # Check if we can add this file
+                if current_tokens + total_tokens_added + file_tokens > MAX_CONTEXT_TOKENS:
+                    console.print(f"[yellow]⏭ Skipping {file_path} (would exceed token limit)[/yellow]")
+                    break
+                
+                # Truncate if individual file is too large
+                if file_tokens > MAX_FILE_TOKENS // 2:  # Use half limit for directory adds
+                    content = truncate_content(content, MAX_FILE_TOKENS // 2)
+                    file_tokens = estimate_tokens(content)
+                
+                relative_path = os.path.relpath(normalized_path, directory_path)
+                files_content.append(f"=== {relative_path} ===\n{content}")
+                added_files.append(relative_path)
+                total_tokens_added += file_tokens
+                
+            except Exception as e:
+                console.print(f"[red]Error reading {file_path}: {e}[/red]")
+        
+        if files_content:
+            # Add all files in a single consolidated message
+            consolidated_content = f"Files from directory '{directory_path}':\n\n" + "\n\n".join(files_content)
+            conversation_history.append({
+                "role": "system",
+                "content": consolidated_content
+            })
+            
+            console.print(f"[bold blue]✓[/bold blue] Added {len(added_files)} files from '[bright_cyan]{directory_path}[/bright_cyan]'")
+            console.print(f"[dim]Tokens added: {total_tokens_added:,} (Total: {get_conversation_tokens():,} / {MAX_CONTEXT_TOKENS:,})[/dim]\n")
+            
+            if added_files:
+                console.print("[bold bright_blue]📁 Added files:[/bold bright_blue]")
+                for f in added_files[:10]:  # Show first 10
+                    console.print(f"  [bright_cyan]📄 {f}[/bright_cyan]")
+                if len(added_files) > 10:
+                    console.print(f"  [dim]... and {len(added_files) - 10} more[/dim]")
+        else:
+            console.print(f"[yellow]⚠ No files could be added from '{directory_path}' due to token limits[/yellow]")
+        
+        if skipped_files and len(skipped_files) < 20:
+            console.print(f"\n[dim]Skipped {len(skipped_files)} files (binary/excluded/large)[/dim]")
 
 def is_binary_file(file_path: str, peek_size: int = 1024) -> bool:
     try:
@@ -585,23 +688,55 @@ def execute_function_call(tool_call) -> str:
         return f"Error executing {function_name}: {str(e)}"
 
 def trim_conversation_history():
-    """Trim conversation history to prevent token limit issues while preserving tool call sequences"""
-    if len(conversation_history) <= 20:  # Don't trim if conversation is still small
+    """Improved trimming that preserves important context."""
+    # Keep more messages and be smarter about what to trim
+    MAX_MESSAGES = 30  # Increased from 15
+    
+    if len(conversation_history) <= MAX_MESSAGES:
         return
-        
+    
     # Always keep the system prompt
-    system_msgs = [msg for msg in conversation_history if msg["role"] == "system"]
-    other_msgs = [msg for msg in conversation_history if msg["role"] != "system"]
+    system_msgs = [msg for msg in conversation_history if msg["role"] == "system" and msg["content"] == system_PROMPT]
+    other_msgs = [msg for msg in conversation_history if msg not in system_msgs]
     
-    # Keep only the last 15 messages to prevent token overflow
-    if len(other_msgs) > 15:
-        other_msgs = other_msgs[-15:]
-    
-    # Rebuild conversation history
-    conversation_history.clear()
-    conversation_history.extend(system_msgs + other_msgs)
+    # If we have too many messages, intelligent trimming
+    if len(other_msgs) > MAX_MESSAGES:
+        # Keep recent messages
+        recent_msgs = other_msgs[-(MAX_MESSAGES-5):]  # Keep last N-5 messages
+        
+        # Also keep the last few user messages for context
+        user_msgs = [msg for msg in other_msgs if msg["role"] == "user"][-5:]
+        
+        # Combine, removing duplicates while preserving order
+        kept_msgs = []
+        seen = set()
+        for msg in user_msgs + recent_msgs:
+            msg_id = id(msg)  # Use object identity
+            if msg_id not in seen:
+                seen.add(msg_id)
+                kept_msgs.append(msg)
+        
+        # Rebuild conversation history
+        conversation_history.clear()
+        conversation_history.extend(system_msgs + kept_msgs)
+        
+        console.print(f"[dim]Trimmed conversation history to {len(conversation_history)} messages[/dim]")
 
 def stream_openai_response(user_message: str):
+    # Check token limit before sending
+    message_tokens = estimate_tokens(user_message)
+    current_tokens = get_conversation_tokens()
+    
+    if current_tokens + message_tokens > MAX_CONTEXT_TOKENS:
+        console.print(f"\n[bold red]⚠ Token limit approaching![/bold red]")
+        console.print(f"Current: {current_tokens:,} tokens")
+        console.print(f"Message: {message_tokens:,} tokens")
+        console.print(f"Total would be: {current_tokens + message_tokens:,} / {MAX_CONTEXT_TOKENS:,}")
+        console.print("\n[yellow]Trimming conversation history...[/yellow]")
+        trim_conversation_history()
+        current_tokens = get_conversation_tokens()
+        console.print(f"[green]After trimming: {current_tokens:,} tokens[/green]\n")
+    
     # Add the user message to conversation history
     conversation_history.append({"role": "user", "content": user_message})
     
@@ -761,6 +896,12 @@ def stream_openai_response(user_message: str):
     except Exception as e:
         error_msg = f"DeepSeek API error: {str(e)}"
         console.print(f"\n[bold red]❌ {error_msg}[/bold red]")
+        
+        # If it's a token limit error, provide helpful info
+        if "65536" in str(e) or "token" in str(e).lower():
+            console.print(f"\n[yellow]Token usage: {get_conversation_tokens():,} / {MAX_CONTEXT_TOKENS:,}[/yellow]")
+            console.print("[yellow]Try starting a new conversation or using fewer files.[/yellow]")
+        
         return {"error": error_msg}
 
 # --------------------------------------------------------------------------------
@@ -770,7 +911,8 @@ def stream_openai_response(user_message: str):
 def main():
     # Create a beautiful gradient-style welcome panel
     welcome_text = """[bold bright_blue]🐋 DeepSeek Engineer[/bold bright_blue] [bright_cyan]with Function Calling[/bright_cyan]
-[dim blue]Powered by DeepSeek-R1 with Chain-of-Thought Reasoning[/dim blue]"""
+[dim blue]Powered by DeepSeek-R1 with Chain-of-Thought Reasoning[/dim blue]
+[yellow]Token-aware version with smart limits[/yellow]"""
     
     console.print(Panel.fit(
         welcome_text,
@@ -783,12 +925,18 @@ def main():
     # Create an elegant instruction panel
     instructions = """[bold bright_blue]📁 File Operations:[/bold bright_blue]
   • [bright_cyan]/add path/to/file[/bright_cyan] - Include a single file in conversation
-  • [bright_cyan]/add path/to/folder[/bright_cyan] - Include all files in a folder
+  • [bright_cyan]/add path/to/folder[/bright_cyan] - Include files from a folder (max 20 files)
   • [dim]The AI can automatically read and create files using function calls[/dim]
 
 [bold bright_blue]🎯 Commands:[/bold bright_blue]
   • [bright_cyan]exit[/bright_cyan] or [bright_cyan]quit[/bright_cyan] - End the session
-  • Just ask naturally - the AI will handle file operations automatically!"""
+  • [bright_cyan]/tokens[/bright_cyan] - Show current token usage
+  • Just ask naturally - the AI will handle file operations automatically!
+
+[bold yellow]⚠ Token Limits:[/bold yellow]
+  • Max context: [bright_yellow]50,000[/bright_yellow] tokens (~200,000 characters)
+  • Max per file: [bright_yellow]8,000[/bright_yellow] tokens (~32,000 characters)
+  • API limit: [bright_yellow]65,536[/bright_yellow] tokens total"""
     
     console.print(Panel(
         instructions,
@@ -817,6 +965,14 @@ def main():
         if user_input.lower() in ["exit", "quit"]:
             console.print("[bold bright_blue]👋 Goodbye! Happy coding![/bold bright_blue]")
             break
+            
+        if user_input.lower() == "/tokens":
+            current = get_conversation_tokens()
+            console.print(f"\n[bold cyan]📊 Token Usage:[/bold cyan]")
+            console.print(f"Current: {current:,} / {MAX_CONTEXT_TOKENS:,} ({current/MAX_CONTEXT_TOKENS*100:.1f}%)")
+            console.print(f"Available: {MAX_CONTEXT_TOKENS - current:,} tokens")
+            console.print(f"Messages in history: {len(conversation_history)}\n")
+            continue
 
         if try_handle_add_command(user_input):
             continue

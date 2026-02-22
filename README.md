@@ -1,7 +1,6 @@
 # DeepSeek Engineer v2 🐋
 
 ## Overview
-
 DeepSeek Engineer v2 is a powerful AI-powered coding assistant that provides an interactive terminal interface for seamless code development. It integrates with DeepSeek's advanced reasoning models to offer intelligent file operations, code analysis, and development assistance through natural conversation and function calling.
 
 ## 🚀 Latest Update: Function Calling Architecture
@@ -90,8 +89,20 @@ For when you want to preload files into conversation context:
    ```
 
 2. **Set up environment**:
+
+   **Windows (PowerShell)**:
+   ```powershell
+   # Use UTF-8 encoding to avoid issues
+   Set-Content -Path .env -Value "DEEPSEEK_API_KEY=your_api_key_here" -Encoding UTF8
+   ```
+
+   **Windows (Command Prompt)**:
+   ```cmd
+   echo DEEPSEEK_API_KEY=your_api_key_here > .env
+   ```
+
+   **Linux/Mac/Git Bash**:
    ```bash
-   # Create .env file
    echo "DEEPSEEK_API_KEY=your_api_key_here" > .env
    ```
 

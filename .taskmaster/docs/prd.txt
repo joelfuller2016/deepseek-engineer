@@ -1,0 +1,24 @@
+# DeepSeek Engineer Unicode Encoding Fix
+
+## Overview
+Fix the UnicodeDecodeError that occurs when running deepseek-eng.py due to incorrect .env file encoding.
+
+## Problem Statement
+The .env file is currently encoded as UTF-16 LE with BOM, but the python-dotenv library expects UTF-8 encoding. This causes the application to crash on startup with:
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
+
+## Requirements
+1. Convert .env file from UTF-16 LE to UTF-8 encoding
+2. Preserve all environment variable content
+3. Ensure deepseek-eng.py runs without encoding errors
+4. Verify the fix is non-breaking
+
+## Technical Details
+- Current encoding: UTF-16 LE with BOM (FF FE)
+- Required encoding: UTF-8 without BOM
+- File location: C:\Users\joelf\deepseek-engineer\.env
+
+## Success Criteria
+- deepseek-eng.py runs without UnicodeDecodeError
+- All environment variables are preserved and accessible
+- No breaking changes to existing functionality
