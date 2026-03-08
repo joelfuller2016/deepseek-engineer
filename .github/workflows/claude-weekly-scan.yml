@@ -1,0 +1,41 @@
+name: Claude Weekly Scan
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+
+            Perform a thorough codebase analysis. Check for:
+            1. Potential bugs and error-prone patterns
+            2. Security vulnerabilities (hardcoded secrets, injection risks)
+            3. Dead code and unused imports
+            4. Missing error handling (uncaught exceptions, missing null checks)
+            5. Performance issues (N+1 queries, unnecessary re-renders)
+            6. Test coverage gaps
+
+            For each issue found, create a GitHub issue using the gh CLI with:
+            - Clear, specific title
+            - Steps to reproduce (if applicable)
+            - Suggested fix approach
+            - The label "claude-fix" so it can be auto-fixed
+          claude_args: |
+            --max-turns 20
+            --allowedTools "Read,Bash(gh issue:*),Bash(git:*)"
