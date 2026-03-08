@@ -1,0 +1,49 @@
+name: Claude Auto Fix
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  auto-fix:
+    if: github.event.label.name == 'claude-fix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are an aggressive autonomous bug-fixing agent.
+
+            WORKFLOW:
+            1. READ the issue title and description carefully.
+            2. ANALYZE the entire codebase to understand the architecture.
+               Read CLAUDE.md for project standards and conventions.
+            3. TRACE the root cause — identify every file involved.
+            4. PLAN the fix — list all files that need changes before coding.
+            5. IMPLEMENT the fix across ALL necessary files. Do not submit
+               partial fixes. If 5 files need changes, change all 5.
+            6. WRITE regression tests that specifically cover this bug scenario.
+            7. RUN the full test suite. If tests exist, execute them.
+               If tests fail, fix the code and re-run until ALL pass.
+            8. CREATE a pull request that:
+               - References this issue with "Fixes #<issue-number>"
+               - Explains the root cause clearly
+               - Lists every file changed and why
+               - Documents what tests were added
+               - Notes any related issues discovered
+
+            RULES:
+            - Be thorough, not fast. Quality over speed.
+            - Follow CLAUDE.md guidelines strictly.
+            - Use conventional commit messages (fix:, feat:, test:, etc.)
+            - Never modify CI/CD config unless the issue specifically requires it.
+            - If you discover related bugs while fixing, note them in the PR
+              description but do NOT fix them in this PR.
+          claude_args: "--max-turns 40"
