@@ -1,0 +1,79 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    if: |
+      github.actor != 'github-actions[bot]' &&
+      github.actor != 'claude[bot]' &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR TITLE: ${{ github.event.pull_request.title }}
+            PR AUTHOR: ${{ github.event.pull_request.user.login }}
+
+            You are an elite code reviewer. Review this PR with maximum thoroughness.
+
+            ## Review Checklist
+
+            ### 1. CORRECTNESS (Critical)
+            - Logic errors, off-by-one, null/undefined, race conditions
+            - Edge cases not handled
+            - Incorrect assumptions about data types or shapes
+            - Missing error handling for external calls (API, DB, file I/O)
+
+            ### 2. SECURITY (Critical)
+            - SQL injection, XSS, CSRF, command injection
+            - Hardcoded secrets, API keys, credentials
+            - Auth/authz bypasses, privilege escalation
+            - Insecure deserialization, path traversal
+            - OWASP Top 10 violations
+
+            ### 3. TESTS
+            - Are there tests for the new/changed code?
+            - Do tests cover happy path AND edge cases?
+            - Are regression tests included for bug fixes?
+            - Test quality: are assertions meaningful?
+
+            ### 4. PERFORMANCE
+            - N+1 queries, unnecessary loops, O(n^2) where O(n) is possible
+            - Memory leaks, unbounded growth
+            - Missing pagination, missing caching where beneficial
+            - Unnecessary re-renders (React), expensive computations
+
+            ### 5. CODE QUALITY
+            - Clear naming, single responsibility
+            - DRY violations, dead code
+            - Consistent style with the rest of the codebase
+            - Proper error messages and logging
+
+            ### 6. ARCHITECTURE
+            - Does this change fit the existing architecture?
+            - Are there better patterns for this use case?
+            - Will this be maintainable long-term?
+
+            ## Output Format
+            For each finding:
+            - **File:Line** — what is wrong
+            - **Why** — why it matters
+            - **Fix** — specific code suggestion
+            - **Severity**: 🔴 CRITICAL | 🟡 WARNING | 🔵 SUGGESTION
+
+            If the PR is solid, say so clearly with specific praise. Do NOT invent problems.
+            Follow CLAUDE.md guidelines if present in the repo.
+          claude_args: "--max-turns 15"
